@@ -9,7 +9,7 @@ from typing import List
 import pandas as pd
 
 from config import SHIFT_LABELS, SHIFT_MAXIMUM, SHIFT_ORDER
-from models import Employee
+from models import Employee, employee_status_label
 from data_store import *
 from planner import shift_staff
 
