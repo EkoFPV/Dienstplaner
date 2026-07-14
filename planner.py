@@ -616,6 +616,52 @@ def shift_has_senior(
         for member in shift_staff(state, employees, d, shift)
     )
 
+
+def shift_new_and_qualified_counts(
+    state: dict,
+    employees: List[Employee],
+    d: date,
+    shift: str,
+) -> Tuple[int, int]:
+    """
+    Gibt (Anzahl Neue, Anzahl Qualifizierte) für eine Schicht zurück.
+
+    Als qualifiziert gelten:
+    - Senior
+    - Erfahren
+
+    Es muss immer gelten:
+        Anzahl Neue <= Anzahl Qualifizierte
+    """
+    staff = shift_staff(state, employees, d, shift)
+
+    new_count = sum(
+        1 for member in staff if member.new_employee
+    )
+    qualified_count = sum(
+        1 for member in staff if is_day_qualified(member)
+    )
+
+    return new_count, qualified_count
+
+
+def new_employee_coverage_is_valid(
+    state: dict,
+    employees: List[Employee],
+    d: date,
+    shift: str,
+) -> bool:
+    if shift not in {"F", "M", "S"}:
+        return True
+
+    new_count, qualified_count = shift_new_and_qualified_counts(
+        state,
+        employees,
+        d,
+        shift,
+    )
+    return new_count <= qualified_count
+
 def requires_four_day_ten_hour_blocks(
     state: dict,
     employee: Employee,
@@ -932,32 +978,41 @@ def schedule_minimum_staff(state: dict, employees: List[Employee], dates: List[d
                 # Dadurch bleibt die Senior-Abdeckung erhalten, ohne andere Personen
                 # dauerhaft aus der Planung zu drängen.
                 existing_staff = shift_staff(state, employees, d, shift)
-                has_new_without_senior = (
-                    any(member.new_employee for member in existing_staff)
-                    and not any(member.senior for member in existing_staff)
+                existing_new_count = sum(
+                    1 for member in existing_staff
+                    if member.new_employee
+                )
+                existing_qualified_count = sum(
+                    1 for member in existing_staff
+                    if is_day_qualified(member)
                 )
 
-                needs_senior = (
-                    (
-                        shift in {"F", "S"}
-                        and not any(
-                            is_day_qualified(member)
-                            for member in existing_staff
-                        )
+                needs_qualified_for_new = (
+                    existing_new_count > existing_qualified_count
+                )
+
+                needs_qualified_coverage = (
+                    shift in {"F", "S"}
+                    and not any(
+                        is_day_qualified(member)
+                        for member in existing_staff
                     )
-                    or has_new_without_senior
                 )
 
-                senior_candidates = [
-                    emp for emp in candidates if emp.senior
-                ]
                 qualified_candidates = [
-                    emp for emp in candidates if is_day_qualified(emp)
+                    emp for emp in candidates
+                    if is_day_qualified(emp)
                 ]
 
-                if has_new_without_senior and senior_candidates:
-                    scoring_pool = senior_candidates
-                elif needs_senior and qualified_candidates:
+                if (
+                    needs_qualified_for_new
+                    and qualified_candidates
+                ):
+                    scoring_pool = qualified_candidates
+                elif (
+                    needs_qualified_coverage
+                    and qualified_candidates
+                ):
                     scoring_pool = qualified_candidates
                 else:
                     scoring_pool = candidates
@@ -1001,21 +1056,27 @@ def schedule_minimum_staff(state: dict, employees: List[Employee], dates: List[d
                         filtered_pool.append(candidate)
                         continue
 
-                    existing_count = len(existing_staff)
-                    senior_already_present = any(
-                        member.senior for member in existing_staff
-                    )
+                    # Für jede neue Person muss mindestens eine gleichzeitige
+                    # qualifizierte Person (Senior oder Erfahren) vorhanden sein.
+                    projected_new_count = existing_new_count + 1
+                    projected_qualified_count = existing_qualified_count
 
-                    # Neue Person nur zulassen, wenn Senior schon da ist oder
-                    # noch mindestens ein Platz für einen Senior frei bleibt.
-                    if (
-                        senior_already_present
-                        or existing_count + 1 < SHIFT_MAXIMUM[shift]
-                    ):
+                    if projected_new_count <= projected_qualified_count:
                         filtered_pool.append(candidate)
 
+                # Falls Neue aktuell nicht regelkonform ergänzt werden können,
+                # werden nur die übrigen Kandidaten verwendet.
                 if filtered_pool:
                     scoring_pool = filtered_pool
+                else:
+                    scoring_pool = [
+                        candidate
+                        for candidate in scoring_pool
+                        if not candidate.new_employee
+                    ]
+
+                if not scoring_pool:
+                    break
 
                 scoring_pool.sort(key=candidate_score)
                 set_schedule(state, scoring_pool[0].name, d, shift)
@@ -1630,54 +1691,116 @@ def repair_new_employee_coverage(
     dates: List[date],
 ) -> None:
     """
-    Sorgt nach der Planung dafür, dass jede neue Person in Früh/Mittel/Spät
-    gemeinsam mit mindestens einem Senior arbeitet.
+    Stellt für Früh-, Mittel- und Spätdienste sicher:
 
-    Falls kein Senior ergänzt werden kann, wird der Dienst der neuen Person
-    entfernt, damit kein unzulässiger Dienst bestehen bleibt.
+        Anzahl Neue <= Anzahl Senior + Anzahl Erfahren
+
+    Beispiele:
+    - Senior + Neu: erlaubt
+    - Erfahren + Neu: erlaubt
+    - Senior + Neu + Neu: nicht erlaubt
+    - Senior + Erfahren + Neu + Neu: erlaubt
+
+    Wenn qualifizierte Personen ergänzt werden können, werden sie hinzugefügt.
+    Andernfalls werden überzählige neue Mitarbeitende aus der Schicht entfernt.
     """
-    for emp in employees:
-        if not emp.new_employee:
-            continue
+    for d in dates:
+        for shift in ("F", "M", "S"):
+            while True:
+                new_count, qualified_count = shift_new_and_qualified_counts(
+                    state,
+                    employees,
+                    d,
+                    shift,
+                )
 
-        for d in dates:
-            shift = get_schedule(state, emp.name, d)
-            if shift not in {"F", "M", "S"}:
-                continue
+                if new_count <= qualified_count:
+                    break
 
-            if shift_has_senior(state, employees, d, shift):
-                continue
+                qualified_candidates = [
+                    candidate
+                    for candidate in employees
+                    if (
+                        is_day_qualified(candidate)
+                        and get_schedule(
+                            state,
+                            candidate.name,
+                            d,
+                        ) not in SHIFT_ORDER
+                        and not would_break_hard_rules(
+                            state,
+                            candidate,
+                            d,
+                            shift,
+                            dates,
+                            enforce_hour_limit=True,
+                        )
+                    )
+                ]
 
-            candidates = [
-                senior
-                for senior in employees
                 if (
-                    senior.senior
-                    and senior.name != emp.name
-                    and not would_break_hard_rules(
+                    qualified_candidates
+                    and len(
+                        shift_staff(
+                            state,
+                            employees,
+                            d,
+                            shift,
+                        )
+                    ) < SHIFT_MAXIMUM[shift]
+                ):
+                    qualified_candidates.sort(
+                        key=lambda candidate: (
+                            calculate_hours(
+                                state,
+                                candidate.name,
+                                dates,
+                            )
+                            / max(
+                                float(candidate.monthly_target),
+                                1.0,
+                            )
+                        )
+                    )
+                    set_schedule(
                         state,
-                        senior,
+                        qualified_candidates[0].name,
                         d,
                         shift,
-                        dates,
-                        enforce_hour_limit=True,
                     )
-                )
-            ]
+                    continue
 
-            if (
-                candidates
-                and len(shift_staff(state, employees, d, shift))
-                < SHIFT_MAXIMUM[shift]
-            ):
-                candidates.sort(
-                    key=lambda senior: calculate_hours(
-                        state, senior.name, dates
-                    ) / max(float(senior.monthly_target), 1.0)
+                new_staff = [
+                    member
+                    for member in shift_staff(
+                        state,
+                        employees,
+                        d,
+                        shift,
+                    )
+                    if member.new_employee
+                ]
+
+                if not new_staff:
+                    break
+
+                # Zuerst jene neue Person entfernen, die bereits am besten
+                # mit Stunden versorgt ist.
+                new_staff.sort(
+                    key=lambda member: calculate_hours(
+                        state,
+                        member.name,
+                        dates,
+                    )
+                    - float(member.monthly_target),
+                    reverse=True,
                 )
-                set_schedule(state, candidates[0].name, d, shift)
-            else:
-                set_schedule(state, emp.name, d, "")
+                set_schedule(
+                    state,
+                    new_staff[0].name,
+                    d,
+                    "",
+                )
 
 def improve_four_day_blocks_for_40h(
     state: dict,
@@ -1877,17 +2000,23 @@ def validate_schedule(state: dict, employees: List[Employee], dates: List[date])
             if (
                 emp.new_employee
                 and shift in {"F", "M", "S"}
-                and not shift_has_senior(
-                    state,
-                    employees,
-                    d,
-                    shift,
-                )
             ):
-                warnings.append(
-                    f"{emp.name}, {d.strftime('%d.%m.%Y')}: "
-                    "Neue Person ohne Senior in derselben Schicht."
+                new_count, qualified_count = (
+                    shift_new_and_qualified_counts(
+                        state,
+                        employees,
+                        d,
+                        shift,
+                    )
                 )
+
+                if new_count > qualified_count:
+                    warnings.append(
+                        f"{emp.name}, {d.strftime('%d.%m.%Y')}: "
+                        f"{new_count} neue Person(en), aber nur "
+                        f"{qualified_count} Senior/Erfahrene in "
+                        f"{SHIFT_LABELS[shift]}."
+                    )
 
             if shift in SHIFT_ORDER and availability in {"U", "X"}:
                 warnings.append(f"{emp.name}, {d.strftime('%d.%m.%Y')}: Dienst trotz Urlaub/Sperre.")
@@ -2244,7 +2373,7 @@ def solve_schedule_with_ortools(
     - kein N vor Urlaub oder Sperre
     - freie Wochenenden
     - Vormonatsübergang
-    - Neu nur gemeinsam mit Senior; Neu nie im Nachtdienst
+    - Neue höchstens im Verhältnis 1:1 mit Senior/Erfahren; Neu nie im Nachtdienst
     - qualifizierte Abdeckung durch Senior oder Erfahren
     - 8h-/10h-Arbeitsblockregeln
 
@@ -2594,6 +2723,11 @@ def solve_schedule_with_ortools(
         for p, emp in enumerate(employees)
         if emp.senior
     ]
+    new_employee_indices = [
+        p
+        for p, emp in enumerate(employees)
+        if emp.new_employee
+    ]
 
     for d in day_indices:
         qualified_f = sum(
@@ -2612,20 +2746,21 @@ def solve_schedule_with_ortools(
         model.Add(qualified_f + qualified_m >= 1)
         model.Add(qualified_s + qualified_m >= 1)
 
-        # Neue Mitarbeitende brauchen in derselben Schicht einen Senior.
-        for p in person_indices:
-            if not employees[p].new_employee:
-                continue
+        # Betreuungsregel für neue Mitarbeitende:
+        # Anzahl Neue darf die Anzahl Senior + Erfahren nicht überschreiten.
+        for shift in ("F", "M", "S"):
+            new_same_shift = sum(
+                x[p, d, shift_index[shift]]
+                for p in new_employee_indices
+            )
+            qualified_same_shift = sum(
+                x[p, d, shift_index[shift]]
+                for p in qualified_indices
+            )
 
-            for shift in ("F", "M", "S"):
-                senior_same_shift = sum(
-                    x[q, d, shift_index[shift]]
-                    for q in senior_indices
-                )
-                model.Add(
-                    x[p, d, shift_index[shift]]
-                    <= senior_same_shift
-                )
+            model.Add(
+                new_same_shift <= qualified_same_shift
+            )
 
     # ------------------------------------------------------------------
     # Zielfunktion
@@ -2998,7 +3133,7 @@ def generate_schedule(state: dict) -> None:
     # 40h-Personen mit 10h-Diensten möglichst in 4er-Blöcke bringen.
     improve_four_day_blocks_for_40h(state, employees, dates)
 
-    # Neue Mitarbeitende dürfen nur gemeinsam mit einem Senior arbeiten.
+    # Neue Mitarbeitende benötigen mindestens gleich viele Senior/Erfahrene.
     repair_new_employee_coverage(state, employees, dates)
 
     # Nach den letzten Korrekturen nochmals Stunden ausgleichen.
